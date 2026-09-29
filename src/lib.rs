@@ -67,9 +67,87 @@ pub use wasm32::utf16_len;
 )))]
 pub use scalar::utf16_len;
 
+/// The kernels behind `utf16_len`, for this crate's tests and benchmarks.
+/// Not part of the public API.
+#[doc(hidden)]
+pub mod __kernels {
+    /// One kernel, including the ASCII prefix scan that runs before it.
+    pub struct Kernel {
+        pub name: &'static str,
+        pub utf16_len: fn(&str) -> usize,
+    }
+
+    /// Every kernel this CPU supports, ending with the one `utf16_len` runs.
+    pub fn available() -> Vec<Kernel> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::x86_64::kernels()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            vec![Kernel {
+                name: "neon",
+                utf16_len: crate::aarch64::utf16_len,
+            }]
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            vec![Kernel {
+                name: "simd128",
+                utf16_len: crate::wasm32::utf16_len,
+            }]
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128"),
+        )))]
+        {
+            vec![Kernel {
+                name: "scalar",
+                utf16_len: crate::scalar::utf16_len,
+            }]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::utf16_len;
+    /// `crate::utf16_len`, after checking that every kernel this CPU supports
+    /// agrees with it, so each test below covers all of them.
+    #[track_caller]
+    fn utf16_len(s: &str) -> usize {
+        let result = super::utf16_len(s);
+        for kernel in super::__kernels::available() {
+            assert_eq!(
+                (kernel.utf16_len)(s),
+                result,
+                "{} kernel disagrees on {} bytes",
+                kernel.name,
+                s.len()
+            );
+        }
+        result
+    }
+
+    // CI sets this where a kernel must run, so an emulator or runner that hides
+    // a CPU feature fails here instead of silently skipping that kernel.
+    #[test]
+    fn expected_kernels_are_available() {
+        let Ok(expected) = std::env::var("SIMD_UTF16_LEN_EXPECT_KERNELS") else {
+            return;
+        };
+        let available: Vec<_> = super::__kernels::available()
+            .iter()
+            .map(|kernel| kernel.name)
+            .collect();
+        for name in expected.split(',') {
+            assert!(
+                available.contains(&name),
+                "{name} kernel is not available; found {available:?}"
+            );
+        }
+    }
 
     /// Reference implementation using the standard library.
     fn reference(s: &str) -> usize {
@@ -132,8 +210,19 @@ mod tests {
     }
 
     #[test]
+    fn every_leader_and_continuation_byte() {
+        // The first and last code point of each UTF-8 width, so every leader
+        // byte value and every continuation byte value the kernels can see.
+        let s = "\u{0}\u{7f}\u{80}\u{7ff}\u{800}\u{ffff}\u{10000}\u{10ffff}";
+        for repeat in 1..=40 {
+            let s = s.repeat(repeat);
+            assert_eq!(utf16_len(&s), reference(&s), "repeat: {repeat}");
+        }
+    }
+
+    #[test]
     fn longer_than_simd_width() {
-        // Ensure the SIMD loop and scalar tail both work (> 16 bytes).
+        // Ensure the SIMD loop and the tail both work (> 16 bytes).
         let s = "abcdefghijklmnopqrstuvwxyz";
         assert_eq!(utf16_len(s), reference(s));
 
@@ -149,20 +238,78 @@ mod tests {
 
     #[test]
     fn repeated_pattern_large() {
-        // Stress test: exceed the 255-iteration batch boundary (255 * 16 = 4080 bytes).
+        // Stress test: exceed the accumulator batches of every kernel several
+        // times, with the maximum 2 units per byte.
         let s = "a".repeat(5000);
         assert_eq!(utf16_len(&s), reference(&s));
 
-        let s = "🦀".repeat(1500); // 1500 * 4 = 6000 bytes
-        assert_eq!(utf16_len(&s), reference(&s));
+        for chars in [1500, 1920, 1921, 3840, 3841, 5000, 7680, 7681, 10000] {
+            let s = "🦀".repeat(chars);
+            assert_eq!(utf16_len(&s), reference(&s), "chars: {chars}");
+        }
     }
 
     #[test]
     fn all_byte_widths_interleaved() {
         // Repeating pattern of 1+2+3+4 byte chars to test alignment variations.
         let pattern = "aé中🦀";
-        let s = pattern.repeat(100);
-        assert_eq!(utf16_len(&s), reference(&s));
+        for repeat in [1, 2, 3, 5, 6, 7, 13, 25, 26, 100, 400, 1000] {
+            let s = pattern.repeat(repeat);
+            assert_eq!(utf16_len(&s), reference(&s), "repeat: {repeat}");
+        }
+    }
+
+    #[test]
+    fn every_length_of_cjk() {
+        // Every tail length of every kernel, past the leftover-vector loop.
+        let storage = "中".repeat(200);
+        for end in storage.char_indices().map(|(i, _)| i) {
+            let s = &storage[..end];
+            assert_eq!(utf16_len(s), reference(s), "len: {}", s.len());
+        }
+    }
+
+    #[test]
+    fn short_inputs_at_page_edges() {
+        // Inputs shorter than a vector load a whole vector forward from their
+        // start when that stays within the page, otherwise backward from
+        // their end, or are copied in debug builds. Surround them with
+        // four-byte leaders, which would change the count if a load counted
+        // bytes outside the input, at every offset around a page boundary.
+        use std::alloc::{Layout, alloc, dealloc};
+        const PAGE: usize = 4096;
+        let layout = Layout::from_size_align(3 * PAGE, PAGE).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let buf = unsafe { alloc(layout) };
+        assert!(!buf.is_null());
+        // SAFETY: buf points to 3 * PAGE writable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(buf, 3 * PAGE) };
+        bytes.fill(0xF0);
+        let inputs = [
+            "a",
+            "é",
+            "中",
+            "🦀",
+            "héllo wörld",
+            "héllo wörld 中文🦀!",
+            "Привет, мир! 你好",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa中",
+        ];
+        for input in inputs {
+            for offset in (PAGE - 80..PAGE + 16).chain(2 * PAGE - 80..2 * PAGE + 16) {
+                let range = offset..offset + input.len();
+                bytes[range.clone()].copy_from_slice(input.as_bytes());
+                let s = std::str::from_utf8(&bytes[range.clone()]).unwrap();
+                assert_eq!(
+                    utf16_len(s),
+                    reference(input),
+                    "offset: {offset}, input: {input}"
+                );
+                bytes[range].fill(0xF0);
+            }
+        }
+        // SAFETY: buf came from alloc with this layout.
+        unsafe { dealloc(buf, layout) };
     }
 
     #[test]
