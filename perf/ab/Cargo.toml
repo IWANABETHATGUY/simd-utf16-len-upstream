@@ -1,0 +1,9 @@
+[package]
+name = "simd-utf16-len-ab"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# scripts/perf-ab.sh builds this from a copy of the repository, once per side.
+simd-utf16-len = { path = "../.." }
