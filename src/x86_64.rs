@@ -60,3 +60,12 @@ unsafe fn utf16_length_sse2(bytes: &[u8], mut i: usize) -> usize {
     // SAFETY: bytes is valid UTF-8, and the SIMD loop maintains i <= len.
     count + unsafe { crate::utf16_len_tail(bytes, i) }
 }
+
+/// The kernels `utf16_len` can run, in the order it prefers them: SSE2 only,
+/// which is baseline on x86_64.
+pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
+    vec![crate::__kernels::Kernel {
+        name: "sse2",
+        utf16_len,
+    }]
+}
