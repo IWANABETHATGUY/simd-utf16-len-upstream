@@ -5,6 +5,10 @@
 //! Where:
 //! - continuation bytes: `(byte & 0xC0) == 0x80`
 //! - four-byte leaders: `byte >= 0xF0`
+//!
+//! The NEON and simd128 kernels follow napi-rs/json-escape-simd's `src/simd`:
+//! a pointer cursor with a remaining-byte count, unrolled vectors per
+//! iteration, and an in-register tail.
 
 #[cfg(any(
     target_arch = "x86_64",
@@ -13,11 +17,7 @@
 ))]
 mod ascii;
 
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128"),
-))]
+#[cfg(target_arch = "x86_64")]
 /// Count the tail after skipping continuation bytes at `i`.
 /// The caller has already counted each preceding leader's full UTF-16 contribution.
 ///
@@ -35,6 +35,74 @@ unsafe fn utf16_len_tail(bytes: &[u8], i: usize) -> usize {
     tail.encode_utf16().count()
 }
 
+/// The 16-byte vector holding an input's last `nb` bytes, with zeros after
+/// them, and the mask of those `nb` lanes, as `$load` produces them.
+///
+/// Must be expanded inside an `unsafe` block, with `$sptr` pointing at the
+/// input's last `nb` bytes and `0 < nb < 16`.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+macro_rules! short_vector {
+    ($sptr:expr, $nb:expr, $load:expr) => {{
+        // Without the hint, LLVM lays this block out on the path of longer
+        // inputs, which measured them 10 to 18% slower on an M3 Max.
+        crate::cold();
+        let (sptr, nb): (*const u8, usize) = ($sptr, $nb);
+        let halves = crate::short_halves(sptr, nb);
+        (
+            $load(halves.as_ptr().cast::<u8>()),
+            $load(crate::keep_first(nb)),
+        )
+    }};
+}
+
+/// The `nb` bytes at `p`, `0 < nb < 16`, as the two little-endian halves of
+/// a 16-byte vector, with zeros after the last byte. No read leaves the
+/// bytes: two overlapping reads of 8 or 4 bytes, with the overlap shifted
+/// out, or the first, middle, and last byte.
+///
+/// # Safety
+/// `p` must point at `nb` readable bytes.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+#[inline(always)]
+unsafe fn short_halves(p: *const u8, nb: usize) -> [u64; 2] {
+    debug_assert!(0 < nb && nb < 16);
+    // SAFETY: each read below stays within the `nb` bytes at `p`.
+    let [lo, hi] = unsafe {
+        if nb >= 8 {
+            let first = u64::from_le(p.cast::<u64>().read_unaligned());
+            let last = u64::from_le(p.add(nb - 8).cast::<u64>().read_unaligned());
+            // Two shifts, since one shift by 64 would be out of range.
+            [first, last >> (8 * (15 - nb)) >> 8]
+        } else if nb >= 4 {
+            let first = u32::from_le(p.cast::<u32>().read_unaligned()) as u64;
+            let last = u32::from_le(p.add(nb - 4).cast::<u32>().read_unaligned()) as u64;
+            [first | ((last >> (8 * (8 - nb))) << 32), 0]
+        } else {
+            let first = *p as u64;
+            let middle = (*p.add(nb / 2) as u64) << (8 * (nb / 2));
+            let last = (*p.add(nb - 1) as u64) << (8 * (nb - 1));
+            [first | middle | last, 0]
+        }
+    };
+    [lo.to_le(), hi.to_le()]
+}
+
+/// Marks the block that calls it as unlikely, so LLVM lays it out after the
+/// others. The empty call itself is dropped.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+#[cold]
+#[inline(never)]
+fn cold() {}
+
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
@@ -50,6 +118,58 @@ mod wasm32;
     all(target_arch = "wasm32", target_feature = "simd128"),
 )))]
 mod scalar;
+
+/// UTF-16 code units each byte contributes, by its high nibble: ASCII bytes
+/// and two- or three-byte leaders count 1, continuation bytes (`0x80..=0xBF`)
+/// count 0, and four-byte leaders (`0xF0..`) count 2 for their surrogate
+/// pair. The kernels shuffle this by the high nibble, the way
+/// json-escape-simd's nibble-table classifier does.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+static UNITS_BY_HIGH_NIBBLE: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 2];
+
+/// Lane masks for the last vector: 64 zero bytes, 64 `0xFF` bytes, 64 zero
+/// bytes. `keep_last` and `keep_first` load a window of it, so the tail
+/// needs no runtime broadcast and compare.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+static KEEP: [u8; 192] = {
+    let mut keep = [0u8; 192];
+    let mut i = 64;
+    while i < 128 {
+        keep[i] = 0xFF;
+        i += 1;
+    }
+    keep
+};
+
+/// A `lanes`-byte mask that is `0xFF` in only its last `nb` lanes, for the
+/// overlapping load of the last `lanes` bytes when only `nb` are uncounted.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+#[inline(always)]
+fn keep_last(lanes: usize, nb: usize) -> *const u8 {
+    debug_assert!(lanes <= 64 && 0 < nb && nb < lanes);
+    KEEP.as_ptr().wrapping_add(64 - lanes + nb)
+}
+
+/// A mask that is `0xFF` in only its first `nb` lanes, for the vector that
+/// holds the last `nb` bytes in its first lanes.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+#[inline(always)]
+fn keep_first(nb: usize) -> *const u8 {
+    debug_assert!(0 < nb && nb < 64);
+    KEEP.as_ptr().wrapping_add(128 - nb)
+}
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::utf16_len;
@@ -271,11 +391,9 @@ mod tests {
 
     #[test]
     fn short_inputs_at_page_edges() {
-        // Inputs shorter than a vector load a whole vector forward from their
-        // start when that stays within the page, otherwise backward from
-        // their end, or are copied in debug builds. Surround them with
-        // four-byte leaders, which would change the count if a load counted
-        // bytes outside the input, at every offset around a page boundary.
+        // Surround short inputs with four-byte leaders, which would change
+        // the count if a load counted bytes outside the input, at every
+        // offset around a page boundary.
         use std::alloc::{Layout, alloc, dealloc};
         const PAGE: usize = 4096;
         let layout = Layout::from_size_align(3 * PAGE, PAGE).unwrap();
