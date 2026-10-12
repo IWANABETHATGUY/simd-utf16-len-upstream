@@ -7,28 +7,17 @@
 //!
 //! Copyright (c) The Rust Project Contributors. See LICENSE-MIT-RUST.
 
+/// Inputs shorter than this take the word-at-a-time path; longer ones are
+/// scanned in 64-byte blocks.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) const BLOCK_MIN: usize = 64;
+
 /// Return the length for ASCII, or a prefix known to contain only ASCII bytes.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 pub(crate) fn ascii_prefix_len(bytes: &[u8]) -> usize {
-    const USIZE_SIZE: usize = size_of::<usize>();
-    const NONASCII_MASK: usize = usize::MAX / 255 * 0x80;
-
-    // Match the standard library's word-at-a-time path for small inputs.
-    if bytes.len() < 64 {
-        let (chunks, remainder) = bytes.as_chunks::<USIZE_SIZE>();
-        for chunk in chunks {
-            let word = usize::from_ne_bytes(*chunk);
-            if (word & NONASCII_MASK) != 0 {
-                // SAFETY: chunk starts within the same allocation as bytes.
-                return unsafe { chunk.as_ptr().offset_from_unsigned(bytes.as_ptr()) };
-            }
-        }
-        return if remainder.iter().all(|b| b.is_ascii()) {
-            bytes.len()
-        } else {
-            bytes.len() - remainder.len()
-        };
+    if bytes.len() < BLOCK_MIN {
+        return ascii_prefix_len_short(bytes);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -38,6 +27,29 @@ pub(crate) fn ascii_prefix_len(bytes: &[u8]) -> usize {
     #[cfg(target_arch = "aarch64")]
     {
         ascii_prefix_len_neon(bytes)
+    }
+}
+
+/// `ascii_prefix_len` for inputs shorter than `BLOCK_MIN`: the standard
+/// library's word-at-a-time path for small inputs.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+pub(crate) fn ascii_prefix_len_short(bytes: &[u8]) -> usize {
+    const USIZE_SIZE: usize = size_of::<usize>();
+    const NONASCII_MASK: usize = usize::MAX / 255 * 0x80;
+
+    let (chunks, remainder) = bytes.as_chunks::<USIZE_SIZE>();
+    for chunk in chunks {
+        let word = usize::from_ne_bytes(*chunk);
+        if (word & NONASCII_MASK) != 0 {
+            // SAFETY: chunk starts within the same allocation as bytes.
+            return unsafe { chunk.as_ptr().offset_from_unsigned(bytes.as_ptr()) };
+        }
+    }
+    if remainder.iter().all(|b| b.is_ascii()) {
+        bytes.len()
+    } else {
+        bytes.len() - remainder.len()
     }
 }
 

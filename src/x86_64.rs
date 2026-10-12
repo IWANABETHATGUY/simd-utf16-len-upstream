@@ -37,14 +37,20 @@ const LONG_MIN: usize = 256;
 /// measured `mixed` and `cjk` 10 to 40% slower on Linux on Zen 3 with the
 /// same instructions, so the kernel's placement decides its speed. The
 /// kernels get restructured first; a later change inlines this. The length
-/// check, the ASCII scan, and its early return are all this function holds;
+/// checks, the ASCII scan, and its early return are all this function holds;
 /// the rest is a tail call into `long` or `non_ascii`.
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
-    if bytes.len() >= LONG_MIN {
+    // Short inputs first, so they pay one length check, as before `long`:
+    // with the `LONG_MIN` check first, inputs of 11 to 53 bytes measured up
+    // to 19% slower on several x86_64 runners.
+    let start = if bytes.len() < crate::ascii::BLOCK_MIN {
+        crate::ascii::ascii_prefix_len_short(bytes)
+    } else if bytes.len() >= LONG_MIN {
         return long(bytes);
-    }
-    let start = crate::ascii::ascii_prefix_len(bytes);
+    } else {
+        crate::ascii::ascii_prefix_len(bytes)
+    };
     if start == bytes.len() {
         start
     } else {
