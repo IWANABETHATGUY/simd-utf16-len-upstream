@@ -43,9 +43,10 @@ pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     // Short inputs first, so they pay one length check, as before `long`:
     // with the `LONG_MIN` check first, inputs of 11 to 53 bytes measured up
-    // to 19% slower on several x86_64 runners.
+    // to 19% slower on several x86_64 runners. Each branch inlines its own
+    // copy of the scan, which keeps only the path for its lengths.
     let start = if bytes.len() < crate::ascii::BLOCK_MIN {
-        crate::ascii::ascii_prefix_len_short(bytes)
+        crate::ascii::ascii_prefix_len(bytes)
     } else if bytes.len() >= LONG_MIN {
         return long(bytes);
     } else {
