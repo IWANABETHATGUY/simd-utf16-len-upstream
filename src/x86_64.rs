@@ -45,9 +45,10 @@ pub fn utf16_len(s: &str) -> usize {
 
 /// Counts the bytes after the ASCII prefix: short inputs run the SSE2 kernel
 /// here, longer ones call the widest kernel this CPU supports, as in
-/// json-escape-simd's dispatch. Always inlined into `utf16_len`, so the call
-/// from there is the only one; every call from here is a tail call, so this
-/// saves no registers.
+/// json-escape-simd's dispatch. Kept out of line: `utf16_len` holds only the
+/// ASCII scan and reaches this with a tail call. Every call from here is a
+/// tail call too, so none of them makes this save registers; on Windows it
+/// still saves xmm6 and xmm7, which the inlined SSE2 kernel uses.
 #[inline(never)]
 fn non_ascii(bytes: &[u8], start: usize) -> usize {
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
