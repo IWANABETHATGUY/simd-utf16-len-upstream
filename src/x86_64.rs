@@ -75,7 +75,9 @@ fn long(bytes: &[u8]) -> usize {
     unsafe {
         match LONG_KERNEL.load(Ordering::Relaxed) {
             #[cfg(feature = "avx512")]
-            AVX512 => utf16_len_avx512_long(bytes),
+            AVX512 => utf16_len_avx512_long::<true>(bytes),
+            #[cfg(feature = "avx512")]
+            AVX512_SKIP => utf16_len_avx512_long::<false>(bytes),
             AVX2 => utf16_len_avx2_long(bytes),
             SSE2 => {
                 let start = crate::ascii::ascii_prefix_len(bytes);
@@ -136,6 +138,9 @@ static LONG_KERNEL: AtomicU8 = AtomicU8::new(0);
 use self::WIDE_KERNEL as LONG_KERNEL;
 #[cfg(feature = "avx512")]
 const AVX512: u8 = 3;
+/// The AVX-512 kernel's ASCII skip, then the AVX2 kernel, for Zen 4.
+#[cfg(feature = "avx512")]
+const AVX512_SKIP: u8 = 4;
 
 /// Detects the CPU's features once and stores the widest kernels they allow.
 #[cold]
@@ -148,14 +153,37 @@ fn detect() {
     };
     #[cfg(feature = "avx512")]
     LONG_KERNEL.store(
-        if is_x86_feature_detected!("avx512bw") {
-            AVX512
-        } else {
+        if !is_x86_feature_detected!("avx512bw") {
             kernel
+        } else if is_zen4() {
+            AVX512_SKIP
+        } else {
+            AVX512
         },
         Ordering::Relaxed,
     );
     WIDE_KERNEL.store(kernel, Ordering::Relaxed);
+}
+
+/// Whether this CPU is an AMD one of family 19h, which with AVX-512 means
+/// Zen 4. Zen 4 runs each 512-bit instruction as two 256-bit halves, so the
+/// AVX-512 kernel's lookups take as long per byte as the AVX2 kernel's, and
+/// it measured up to 12% slower than AVX2 on long non-ASCII input on an EPYC
+/// 9V74. Its ASCII skip, which only loads and ors, still measured 8 to 13%
+/// faster there.
+#[cfg(feature = "avx512")]
+fn is_zen4() -> bool {
+    // Miri can't run `cpuid`.
+    if cfg!(miri) {
+        return false;
+    }
+    let vendor = __cpuid(0);
+    let amd = [vendor.ebx, vendor.edx, vendor.ecx]
+        == [*b"Auth", *b"enti", *b"cAMD"].map(u32::from_le_bytes);
+    // AMD's family is the base family plus the extended family.
+    let eax = __cpuid(1).eax;
+    let family = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
+    amd && family == 0x19
 }
 
 /// Detects the CPU's features once, then counts with the kernel they select.
@@ -205,6 +233,10 @@ pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
             name: "avx512",
             utf16_len: avx512,
         });
+        kernels.push(Kernel {
+            name: "avx512_skip",
+            utf16_len: avx512_skip,
+        });
     }
     kernels
 }
@@ -239,9 +271,21 @@ fn avx2(s: &str) -> usize {
 fn avx512(s: &str) -> usize {
     // SAFETY: `kernels` only lists this after detecting AVX-512BW.
     if s.len() >= LONG_MIN {
-        return unsafe { utf16_len_avx512_long(s.as_bytes()) };
+        return unsafe { utf16_len_avx512_long::<true>(s.as_bytes()) };
     }
     with_kernel(s, |bytes, start| unsafe { utf16_len_avx512(bytes, start) })
+}
+
+/// What `utf16_len` runs on Zen 4: the AVX-512 skip for long inputs, and the
+/// AVX2 kernel for counting.
+#[cfg(feature = "avx512")]
+fn avx512_skip(s: &str) -> usize {
+    // SAFETY: `kernels` only lists this after detecting AVX-512BW, which
+    // implies AVX2.
+    if s.len() >= LONG_MIN {
+        return unsafe { utf16_len_avx512_long::<false>(s.as_bytes()) };
+    }
+    with_kernel(s, |bytes, start| unsafe { utf16_len_avx2(bytes, start) })
 }
 
 /// SSE2 kernel, `#[inline(always)]` so short inputs run it inside `non_ascii`
@@ -456,14 +500,15 @@ unsafe fn utf16_len_avx2_long(bytes: &[u8]) -> usize {
 }
 
 /// The AVX-512BW kernel for long inputs, as `utf16_len_avx2_long` with
-/// 256-byte blocks.
+/// 256-byte blocks. Counts with the AVX-512 kernel, or with the AVX2 one
+/// when `COUNT_AVX512` is false.
 ///
 /// # Safety
 /// The CPU must support AVX-512BW, and `bytes` must be valid UTF-8 of at
 /// least `LONG_MIN` bytes.
 #[cfg(feature = "avx512")]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn utf16_len_avx512_long(bytes: &[u8]) -> usize {
+unsafe fn utf16_len_avx512_long<const COUNT_AVX512: bool>(bytes: &[u8]) -> usize {
     const BLOCK: usize = 256;
 
     let ptr = bytes.as_ptr();
@@ -484,7 +529,11 @@ unsafe fn utf16_len_avx512_long(bytes: &[u8]) -> usize {
             }
             start += BLOCK;
         }
-        utf16_len_avx512(bytes, start)
+        if COUNT_AVX512 {
+            utf16_len_avx512(bytes, start)
+        } else {
+            utf16_len_avx2(bytes, start)
+        }
     }
 }
 
